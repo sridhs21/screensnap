@@ -335,7 +335,6 @@ fn run_interactive_mode() -> Result<()> {
     
     let stdin = io::stdin();
     let mut input = String::new();
-    
     // Main menu loop
     loop {
         println!("\nMain Menu:");

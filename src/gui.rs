@@ -1,9 +1,9 @@
 // src/gui.rs
 use anyhow::Result;
 use eframe::egui;
-use egui::{Align, Color32, Layout, RichText, ScrollArea, Stroke, Vec2, Ui};
+use egui::{Align, Color32, Layout, RichText, ScrollArea, Stroke, Vec2, Ui, Order}; // Removed ViewportCommand
 use image::ImageFormat;
-use log::{error, info, warn}; // Ensure info and warn are enabled in your logger
+use log::{error, info, warn}; 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,7 +20,44 @@ const SIDEBAR_WIDTH: f32 = 400.0;
 const HANDLE_WIDTH: f32 = 20.0;
 const HANDLE_HEIGHT: f32 = 100.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 600.0; 
+const CLOSED_WINDOW_HEIGHT: f32 = HANDLE_HEIGHT + 20.0;
 const CHAT_INPUT_AREA_HEIGHT: f32 = 50.0; 
+const TASKBAR_BUFFER: f32 = 40.0;
+
+fn get_ollama_url(url_arg: Option<String>) -> String {
+    url_arg.unwrap_or_else(|| {
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string())
+    })
+}
+
+fn get_primary_monitor_info() -> (f32, f32, f32, f32) {
+    let mut mon_abs_x = 0.0f32;
+    let mut mon_abs_y = 0.0f32;
+    let mut mon_width = 1920.0f32;
+    let mut mon_height = 1080.0f32;
+
+    match screenshots::Screen::all() {
+        Ok(screens) => {
+            if screens.is_empty() {
+                error!("get_primary_monitor_info: No screens found. Using default values.");
+            } else {
+                let primary_screen_opt = screens.iter().find(|s| s.display_info.is_primary);
+                let screen_to_use = primary_screen_opt.unwrap_or_else(|| {
+                    warn!("get_primary_monitor_info: Could not identify primary screen. Using first screen.");
+                    &screens[0]
+                });
+                mon_abs_x = screen_to_use.display_info.x as f32;
+                mon_abs_y = screen_to_use.display_info.y as f32;
+                mon_width = screen_to_use.display_info.width as f32;
+                mon_height = screen_to_use.display_info.height as f32;
+            }
+        }
+        Err(e) => {
+            error!("get_primary_monitor_info: Failed to get screen info: {}. Using default values.", e);
+        }
+    }
+    (mon_abs_x, mon_abs_y, mon_width, mon_height)
+}
 
 struct ThreadSafeState {
     processing: bool,
@@ -45,7 +82,6 @@ pub struct ScreenSnapApp {
     animation_duration: f32,
     was_layout_initialized: bool,
     was_style_initialized: bool,
-
     screenshot_manager: Arc<Mutex<ScreenshotManager>>,
     state: Arc<Mutex<ThreadSafeState>>,
     model_name: String,
@@ -53,6 +89,7 @@ pub struct ScreenSnapApp {
     selected_window: Option<String>,
     chat_history: Vec<ChatMessage>,
     current_input: String,
+    should_exit: bool, // Added flag
 }
 
 impl Default for ScreenSnapApp {
@@ -78,12 +115,19 @@ impl Default for ScreenSnapApp {
             was_style_initialized: false, 
             screenshot_manager, state, model_name: "llava:latest".to_string(), window_list,
             selected_window: None, chat_history: Vec::new(), current_input: String::new(),
+            should_exit: false, // Initialize flag
         }
     }
 }
 
 impl eframe::App for ScreenSnapApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Check for exit condition first
+        if self.should_exit {
+            frame.close();
+            return;
+        }
+
         if !self.was_style_initialized {
             let mut style = (*ctx.style()).clone();
             style.visuals.window_fill = Color32::TRANSPARENT;
@@ -116,25 +160,30 @@ impl eframe::App for ScreenSnapApp {
 
         if !self.was_layout_initialized && ctx.screen_rect().width() > 0.0 {
             let current_app_window_width = ctx.screen_rect().width();
-            let initial_x = if self.open { current_app_window_width - SIDEBAR_WIDTH } else { current_app_window_width };
+            let initial_x = current_app_window_width; 
             self.current_x = initial_x;
             self.target_x = initial_x;
             self.animation_start_x = initial_x;
             self.was_layout_initialized = true;
-            info!("Layout initialized: app_width={}, initial_x={}", current_app_window_width, initial_x);
+            info!(
+                "Layout initialized: app_width={}, initial_x (panel's left edge, closed state)={}", 
+                current_app_window_width, initial_x
+            );
         }
 
-        let current_app_window_width_for_sidebar = ctx.screen_rect().width();
-        let correct_target_x_for_current_state = if self.open { current_app_window_width_for_sidebar - SIDEBAR_WIDTH } else { current_app_window_width_for_sidebar };
+        let current_app_window_width = ctx.screen_rect().width();
+        
+        let correct_target_x_for_panel_drawing = if self.open { 
+            HANDLE_WIDTH 
+        } else { 
+            current_app_window_width 
+        };
 
         if self.animation_start_time.is_none() {
-            if self.current_x != correct_target_x_for_current_state || self.target_x != correct_target_x_for_current_state {
-                // info!("Correcting position: current_x={}, target_x={}, correct_target_x={}", 
-                //       self.current_x, self.target_x, correct_target_x_for_current_state);
-                self.current_x = correct_target_x_for_current_state;
-                self.target_x = correct_target_x_for_current_state;
-                self.animation_start_x = self.current_x;
+            if self.current_x != correct_target_x_for_panel_drawing {
+                self.current_x = correct_target_x_for_panel_drawing;
             }
+            self.target_x = correct_target_x_for_panel_drawing;
         }
 
         if let Some(start_time) = self.animation_start_time {
@@ -142,55 +191,77 @@ impl eframe::App for ScreenSnapApp {
             let progress = (elapsed / self.animation_duration).min(1.0);
             let ease = 1.0 - (1.0 - progress).powi(3);
             self.current_x = self.animation_start_x + (self.target_x - self.animation_start_x) * ease;
+            
             if progress >= 1.0 {
-                info!(
-                    "Animation ended. Target_x={}, Attempted current_x={}, Final current_x after set={}",
-                    self.target_x, self.current_x, self.target_x // Value it will be set to
-                );
                 self.current_x = self.target_x;
                 self.animation_start_x = self.current_x; 
                 self.animation_start_time = None;
+                
+                if !self.open { 
+                    let closed_width = HANDLE_WIDTH;
+                    let closed_height = CLOSED_WINDOW_HEIGHT;
+                    frame.set_window_size(egui::vec2(closed_width, closed_height));
+
+                    let (mon_abs_x, mon_abs_y, mon_width, mon_height) = get_primary_monitor_info();
+                    let desired_x = mon_abs_x + mon_width - closed_width;
+                    let desired_y = mon_abs_y + mon_height - closed_height - TASKBAR_BUFFER;
+                    frame.set_window_pos(egui::pos2(desired_x.max(0.0), desired_y.max(0.0)));
+                    info!(
+                        "Animation to CLOSE ended. Repositioned to ({}, {}). Window size: ({}, {})",
+                        desired_x, desired_y, closed_width, closed_height
+                    );
+                } else { 
+                    let open_width = SIDEBAR_WIDTH + HANDLE_WIDTH;
+                    let open_height = DEFAULT_WINDOW_HEIGHT;
+                    frame.set_window_size(egui::vec2(open_width, open_height));
+                    info!(
+                        "Animation to OPEN ended. Window size: ({}, {})",
+                        open_width, open_height
+                    );
+                }
             }
             ctx.request_repaint();
         }
-
-        let sidebar_panel_rect = egui::Rect::from_min_size(
-            egui::pos2(self.current_x, 0.0),
-            egui::vec2(SIDEBAR_WIDTH, ctx.screen_rect().height()),
-        );
-        if self.current_x < ctx.screen_rect().width() + SIDEBAR_WIDTH { // Draw if any part might be visible or moving
-            egui::Area::new("sidebar")
-                .fixed_pos(sidebar_panel_rect.min)
-                .show(ctx, |ui| {
-                    // info!("Drawing sidebar Area at x: {}, width: {}", sidebar_panel_rect.min.x, SIDEBAR_WIDTH);
-                    egui::Frame::dark_canvas(ui.style())
-                        .fill(Color32::from_rgb(25, 25, 25))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(70, 70, 70)))
-                        .shadow(egui::epaint::Shadow {
-                            extrusion: 8.0, 
-                            color: Color32::from_black_alpha(80),
-                        })
-                        .show(ui, |frame_ui| { 
-                            frame_ui.set_max_width(SIDEBAR_WIDTH); // This ensures the Ui inside the frame has this max_width
-                            frame_ui.set_min_width(SIDEBAR_WIDTH); // Explicitly set min_width too
-                            frame_ui.set_min_height(ctx.screen_rect().height());
-                            // info!("Frame UI for sidebar content: available_width={}", frame_ui.available_width());
-                            self.draw_sidebar_contents(frame_ui, ctx);
-                        });
-                });
+        
+        if self.open || self.animation_start_time.is_some() {
+            let sidebar_panel_rect = egui::Rect::from_min_size(
+                egui::pos2(self.current_x, 0.0), 
+                egui::vec2(SIDEBAR_WIDTH, ctx.screen_rect().height()),
+            );
+            if sidebar_panel_rect.max.x > 0.0 && sidebar_panel_rect.min.x < ctx.screen_rect().width() || self.open {
+                egui::Area::new("sidebar")
+                    .fixed_pos(sidebar_panel_rect.min)
+                    .order(Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::dark_canvas(ui.style())
+                            .fill(Color32::from_rgb(25, 25, 25))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(70, 70, 70)))
+                            .shadow(egui::epaint::Shadow {
+                                extrusion: 8.0, 
+                                color: Color32::from_black_alpha(80),
+                            })
+                            .show(ui, |frame_ui| { 
+                                frame_ui.set_max_width(SIDEBAR_WIDTH); 
+                                frame_ui.set_min_width(SIDEBAR_WIDTH); 
+                                frame_ui.set_min_height(ctx.screen_rect().height());
+                                self.draw_sidebar_contents(frame_ui, ctx);
+                            });
+                    });
+            }
         }
 
         let handle_x_pos = self.current_x - HANDLE_WIDTH;
         let handle_center_y = (ctx.screen_rect().height() - HANDLE_HEIGHT) / 2.0f32;
         let time = ctx.input(|i| i.time);
-        let bobbing_offset_f64 = (time * 1.5).sin() * 3.0;
-        let bobbing_offset_f32 = bobbing_offset_f64 as f32;
+        let bobbing_offset_f32 = (time * 1.5).sin() as f32 * 3.0;
         let handle_rect = egui::Rect::from_min_size(
-            egui::pos2(handle_x_pos, handle_center_y + bobbing_offset_f32),
+            egui::pos2(handle_x_pos.max(0.0), handle_center_y + bobbing_offset_f32),
             egui::vec2(HANDLE_WIDTH, HANDLE_HEIGHT),
         );
+        
         egui::Area::new("handle")
             .fixed_pos(handle_rect.min)
+            .order(Order::Foreground) 
             .show(ctx, |ui| {
                 egui::Frame::dark_canvas(ui.style())
                     .fill(Color32::from_rgb(42, 90, 170))
@@ -210,18 +281,22 @@ impl eframe::App for ScreenSnapApp {
                                 .frame(false)
                             ).clicked() {
                                 self.open = !self.open;
-                                let app_w = ctx.screen_rect().width();
-                                let new_target_x = if self.open { // If NOW open
-                                    app_w - SIDEBAR_WIDTH
-                                } else { // If NOW closed
-                                    app_w
-                                };
-                                info!(
-                                    "Handle clicked. self.open={}, app_width={}, SIDEBAR_WIDTH={}, HANDLE_WIDTH={}, new_target_x={}. current_x was {}",
-                                    self.open, app_w, SIDEBAR_WIDTH, HANDLE_WIDTH, new_target_x, self.current_x
-                                );
-                                self.target_x = new_target_x;
                                 self.animation_start_x = self.current_x;
+                                
+                                if self.open { 
+                                    frame.set_window_size(egui::vec2(SIDEBAR_WIDTH + HANDLE_WIDTH, DEFAULT_WINDOW_HEIGHT));
+                                    self.target_x = HANDLE_WIDTH;
+                                    info!(
+                                        "Handle clicked to OPEN. Current panel_x: {}. Target panel_x: {}. Window expanded.",
+                                        self.animation_start_x, self.target_x
+                                    );
+                                } else { 
+                                    self.target_x = ctx.screen_rect().width();
+                                    info!(
+                                        "Handle clicked to CLOSE. Current panel_x: {}. Target panel_x: {} (current window width).",
+                                        self.animation_start_x, self.target_x
+                                    );
+                                }
                                 self.animation_start_time = Some(Instant::now());
                             }
                         });
@@ -230,32 +305,26 @@ impl eframe::App for ScreenSnapApp {
     }
 }
 
-impl ScreenSnapApp {
+impl ScreenSnapApp {    
     fn draw_sidebar_contents(&mut self, frame_ui: &mut Ui, ctx: &egui::Context) {
-        let app_window_width_for_sidebar_logic = ctx.screen_rect().width();
-        
-        // This ensures that all content added to frame_ui respects the sidebar's width
-        // frame_ui.set_max_width(SIDEBAR_WIDTH); // Already set by the caller Frame
-
-        let top_section_response = frame_ui.vertical(|ui| { // Capture response of the top section
+        let top_section_response = frame_ui.vertical(|ui| {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.heading(RichText::new("ScreenSnap AI").size(22.0));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button(RichText::new("✕").size(16.0)).clicked() {
-                        self.open = false;
-                        self.target_x = app_window_width_for_sidebar_logic; // Should use ctx.screen_rect().width()
-                        self.animation_start_x = self.current_x;
-                        self.animation_start_time = Some(Instant::now());
+                    if ui.button(RichText::new("✕").size(16.0)).clicked() { 
+                        info!("Application exit button clicked from sidebar.");
+                        self.should_exit = true; // Set flag to exit
+                        ctx.request_repaint(); // Ensure update loop runs to process exit
                     }
                 });
             });
             ui.separator();
             ui.add_space(8.0);
             
-            ui.horizontal(|ui| {
+             ui.horizontal(|ui| {
                 let button_size = egui::vec2(ui.available_width() * 0.5 - 4.0, 36.0);
                 if ui.add_sized(button_size, egui::Button::new(
                     RichText::new("📷 Capture Screen").size(14.0))
@@ -366,7 +435,7 @@ impl ScreenSnapApp {
             if should_analyze {
                 self.analyze_image();
             }
-        }).response; // Get the response of the vertical layout for its rect
+        }).response; 
 
 
         let image_to_load_opt: Option<image::DynamicImage> = {
@@ -404,10 +473,10 @@ impl ScreenSnapApp {
         };
         
         let full_sidebar_rect = frame_ui.max_rect(); 
-        let top_section_bottom = top_section_response.rect.bottom(); // Use the bottom of the actually rendered top section
+        let top_section_bottom = top_section_response.rect.bottom();
 
         let scroll_area_top = top_section_bottom;
-        let scroll_area_bottom = full_sidebar_rect.bottom() - CHAT_INPUT_AREA_HEIGHT;
+        let scroll_area_bottom = (full_sidebar_rect.bottom() - CHAT_INPUT_AREA_HEIGHT).max(scroll_area_top);
         
         let scroll_area_rect = egui::Rect::from_min_max(
             egui::pos2(full_sidebar_rect.left(), scroll_area_top),
@@ -416,18 +485,12 @@ impl ScreenSnapApp {
 
         if scroll_area_rect.height() > 0.0 { 
             frame_ui.allocate_ui_at_rect(scroll_area_rect, |scroll_ui| {
-                if is_image_texture_available || !ai_response_cloned.is_empty() || !self.chat_history.is_empty() {
-                    // Only add separator if there's content to separate from top section
-                    if top_section_response.rect.height() > 0.0 { // Check if top section actually drew anything
-                       // scroll_ui.separator(); // Separator can be part of scroll content if desired
-                    }
-                }
                 ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .stick_to_bottom(true)
                     .show(scroll_ui, |inner_scroll_ui| {
                         if is_image_texture_available || !ai_response_cloned.is_empty() || !self.chat_history.is_empty() {
-                             inner_scroll_ui.separator(); // Separator at the top of scroll content
+                             inner_scroll_ui.separator(); 
                         }
                         if let Some(texture) = &texture_handle_clone {
                             inner_scroll_ui.add_space(5.0);
@@ -480,16 +543,16 @@ impl ScreenSnapApp {
             });
         }
 
-
         let input_area_rect = egui::Rect::from_min_max(
-            egui::pos2(full_sidebar_rect.left(), full_sidebar_rect.bottom() - CHAT_INPUT_AREA_HEIGHT),
+            egui::pos2(full_sidebar_rect.left(), (full_sidebar_rect.bottom() - CHAT_INPUT_AREA_HEIGHT).max(scroll_area_top) ), 
             egui::pos2(full_sidebar_rect.right(), full_sidebar_rect.bottom())
         );
-        frame_ui.allocate_ui_at_rect(input_area_rect, |input_ui| {
-            self.draw_modern_chat_input(input_ui);
-        });
+        if input_area_rect.height() >= 0.0 { 
+            frame_ui.allocate_ui_at_rect(input_area_rect, |input_ui| {
+                self.draw_modern_chat_input(input_ui);
+            });
+        }
     }
-
 
     fn draw_chat_message(&self, ui: &mut Ui, message: &ChatMessage) {
         let (bubble_color, text_color, name_text, name_color) = if message.is_user {
@@ -640,16 +703,20 @@ impl ScreenSnapApp {
             }
             state_guard.image_data.clone()
         };
-        let model_name = self.model_name.clone();
-        let state_clone = Arc::clone(&self.state);
+        
+        let model_name = self.model_name.clone(); 
+        let state_clone = Arc::clone(&self.state); 
+        let ollama_host_url_str = get_ollama_url(None); 
+
         {
             let mut state_guard = self.state.lock().unwrap();
             state_guard.processing = true;
             state_guard.ai_response = "Processing image...".to_string(); 
         }
         info!("Starting AI analysis for image.");
+        
         thread::spawn(move || {
-            std::env::set_var("OLLAMA_HOST", &get_ollama_url(None));
+            std::env::set_var("OLLAMA_HOST", &ollama_host_url_str); 
             match LocalModel::new(&model_name) {
                 Ok(mut ai_model) => {
                     match ai_model.process_image(&image_data_bytes) {
@@ -722,7 +789,7 @@ impl ScreenSnapApp {
                     }
                 },
                 "/analyze" => {
-                    let mut state_guard_check = self.state.lock().unwrap(); 
+                    let state_guard_check = self.state.lock().unwrap(); 
                     if state_guard_check.image_data.is_empty() {
                         response_text = "Please capture an image first using /capture or /window.".to_string();
                     } else {
@@ -779,14 +846,16 @@ impl ScreenSnapApp {
         };
         let model_name = self.model_name.clone();
         let state_clone = Arc::clone(&self.state);
-        let prompt_clone = prompt.clone();
+        let prompt_clone = prompt; 
+        let ollama_host_url_str = get_ollama_url(None);
+
         {
             let mut state_guard = self.state.lock().unwrap();
             state_guard.processing = true;
             state_guard.ai_response = "Processing with your prompt...".to_string();
         }
         thread::spawn(move || {
-            std::env::set_var("OLLAMA_HOST", &get_ollama_url(None));
+            std::env::set_var("OLLAMA_HOST", &ollama_host_url_str);
             match LocalModel::new(&model_name) {
                 Ok(mut ai_model) => {
                     ai_model.set_prompt(&prompt_clone); 
@@ -869,60 +938,28 @@ impl ScreenSnapApp {
     }
 }
 
-fn get_ollama_url(url_arg: Option<String>) -> String {
-    url_arg.unwrap_or_else(|| {
-        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string())
-    })
-}
-
 pub fn run_gui() -> Result<()> {
     info!("ScreenSnap GUI starting up...");
 
-    let mut mon_abs_x = 0.0f32;
-    let mut mon_abs_y = 0.0f32;
-    let mut mon_width = 1920.0f32; 
-    let mut mon_height = 1080.0f32; 
+    let (mon_abs_x, mon_abs_y, mon_width, mon_height) = get_primary_monitor_info();
 
-    match screenshots::Screen::all() {
-        Ok(screens) => {
-            if screens.is_empty() {
-                error!("run_gui: No screens found by screenshots crate. Using default values for positioning.");
-            } else {
-                let primary_screen_opt = screens.iter().find(|s| s.display_info.is_primary);
-                let screen_to_use = primary_screen_opt.unwrap_or_else(|| {
-                    warn!("run_gui: Could not identify primary screen. Using the first screen found.");
-                    &screens[0]
-                });
-                mon_abs_x = screen_to_use.display_info.x as f32;
-                mon_abs_y = screen_to_use.display_info.y as f32;
-                mon_width = screen_to_use.display_info.width as f32;
-                mon_height = screen_to_use.display_info.height as f32;
-                info!(
-                    "run_gui: Using screen for positioning: AbsX={}, AbsY={}, Width={}, Height={}",
-                    mon_abs_x, mon_abs_y, mon_width, mon_height
-                );
-            }
-        }
-        Err(e) => {
-            error!("run_gui: Failed to get screen info via screenshots crate: {}. Using default values.", e);
-        }
-    }
+    let initial_window_width = HANDLE_WIDTH;
+    let initial_window_height = CLOSED_WINDOW_HEIGHT; 
 
-    let app_window_width = SIDEBAR_WIDTH + HANDLE_WIDTH;
-    let app_window_height = DEFAULT_WINDOW_HEIGHT;
-    let desired_x = mon_abs_x + mon_width - app_window_width;
-    let taskbar_buffer = 40.0; 
-    let desired_y = mon_abs_y + mon_height - app_window_height - taskbar_buffer;
-    
-    info!("run_gui: Calculated initial window position: x={}, y={}", desired_x, desired_y);
+    let desired_x = mon_abs_x + mon_width - initial_window_width;
+    let desired_y = mon_abs_y + mon_height - initial_window_height - TASKBAR_BUFFER; 
+
+    info!("run_gui: Calculated initial window state: pos=({},{}), size=({},{})",
+           desired_x, desired_y, initial_window_width, initial_window_height);
 
     let native_options = eframe::NativeOptions {
         initial_window_pos: Some(egui::pos2(desired_x.max(0.0), desired_y.max(0.0))),
-        initial_window_size: Some(egui::vec2(app_window_width, app_window_height)),
+        initial_window_size: Some(egui::vec2(initial_window_width, initial_window_height)), 
         transparent: true,
         decorated: false,
         always_on_top: true,
         fullscreen: false,
+        resizable: false, 
         ..eframe::NativeOptions::default()
     };
 
